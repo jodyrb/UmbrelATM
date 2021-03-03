@@ -31,7 +31,7 @@ from_cam = multiprocessing.JoinableQueue(1)
 
 os.environ["PYCOIN_BTC_PROVIDERS"] = "blockchain.info blockr.io blockexplorer.com"
 
-ourPrivateKey = "KzFEXXc1F3U1234567896cyHvnLMieFRT2oWMnW6tqx6G2"
+ourPrivateKey = "KzFEXXc1F3UchXFFJZFEhnkxXs6cyHvnLMieFRT2oWMnW6tqx6G2"
 cashAcceptorOn = False # global variable to tell acceptCash() if it should keep looping or not
 
 txdb = shelve.open("txdb.shelve", writeback=True)
@@ -83,6 +83,7 @@ fraudAttempt    = False  # someone tried to break in
 
 def main():
 	getTxFee()
+	#processTakeBTC('Kz6C2GFe5GfERfzw9soT7b2R8LPSV2kV18rKx38XR5QKnJU3vcX2', 0.003, 1)
 	processPendingTx()
 	getPrices()
 	to_cam.put('start')	# start the camera
@@ -111,12 +112,12 @@ def scanQR():
 	camera = picamera.PiCamera()
 	#
 	# MAX_IMAGE_RESOLUTION required so preview field of view matches capture one.
-	#camera.resolution = camera.MAX_IMAGE_RESOLUTION
+	camera.resolution = camera.MAX_RESOLUTION
 	#
 	# position and size info
-	camera.rotation = 270
+	camera.rotation = 0
 	camera.preview_fullscreen = False
-	camera.preview_window = (10, 229, 323, 240)	# x, y, width, height
+	camera.preview_window = (0, 0, 323, 240)	# x, y, width, height
 	#
 	# loop forever
 	while True:
@@ -127,13 +128,13 @@ def scanQR():
 			camera.start_preview()
 			#
 			loop = True
-			print "camera started"
+			print "camera thread: camera started by command"
 			while loop:
 				# Create an in-memory stream
 				stream = io.BytesIO()
 				#
 				# jpeg to save memory, resize to make processing faster, use_video_port to not change modes
-				camera.capture(stream, format='jpeg', resize=(640, 480), use_video_port=True)
+				camera.capture(stream, format='jpeg', resize=(1024, 768), use_video_port=True)
 				#
 				# Rewind the stream for reading
 				stream.seek(0)
@@ -162,7 +163,7 @@ def scanQR():
 							from_cam.put(str(symbol.data))
 						camera.stop_preview()
 						loop = False
-						print "camera stopped by QR capture"
+						print "camera thread: camera stopped by QR capture"
 						break
 				# stop if told
 				if not to_cam.empty():
@@ -242,11 +243,12 @@ def processQRCode(code):
 	if is_valid_bitcoin_address(code):
 		print "this is a bitcoin address"
 		giveBTC(code)
+		print "main thread: telling camera to start"
 		to_cam.put('start') # reset for the next person
-		camera.start_preview()
 	elif is_valid_wif(code):
 		print "this is a private key"
 		takeBTC(code)
+		print "main thread: telling camera to start"
 		to_cam.put('start') # reset for the next person
 	else:
 		print "this is not a bitcoin address or private key"
@@ -256,9 +258,8 @@ def takeBTC(theirPrivateKey):
 	global moneyCount
 	global ourPrivateKey
 	global txdb
+	global tx_fee
 	theirAddress = wif2address(theirPrivateKey)
-	addressBalance = getBalance(theirAddress)
-	insertedDollars = round((addressBalance * tickerPrice),2)
 	billValue = channelValue[SSPrecycleChannel]
 	
 	if theirAddress in txdb['receiving']:
@@ -288,23 +289,26 @@ def takeBTC(theirPrivateKey):
 			print "we are still waiting on a confirmation for a transaction for that address"
 			return
 	else:
+		stdTxFee = (tx_fee.TX_FEE_PER_THOUSAND_BYTES / 100000000)
+		addressBalance = getBalance(theirAddress)
+		usableAddressBalance = addressBalance - stdTxFee
+		valueInDollars = round((usableAddressBalance * tickerPrice),2)
 		print "the corresponding address is: " + theirAddress
-		print "the balance at that address is: " , addressBalance , " bitcoin"
-		print "which is $" , insertedDollars
-		if insertedDollars < billValue:
+		print "the balance at that address is: " , addressBalance , " BTC"
+		print "but the txFee is ", stdTxFee, " BTC"
+		print "so the usable address balance is ", usableAddressBalance, " BTC"
+		print "which is $" , valueInDollars
+		if valueInDollars < billValue:
 			print "doing nothing. minimum $" , billValue
 			return
-		toDispenseBills = math.trunc(insertedDollars / billValue)
+		toDispenseBills = math.trunc(valueInDollars / billValue)
 		toDispenseValue = toDispenseBills * billValue
-		toReturnDollars = round((insertedDollars - toDispenseValue),2)
-		toTakeBitcoin = round(toDispenseValue / tickerPrice)
+		toReturnDollars = round((valueInDollars - toDispenseValue),2)
+		halfSatoshi = 0.000000005 # so we always round down to prevent overspending
+		toTakeBitcoin = round(((toDispenseValue / tickerPrice) - halfSatoshi),8)
 		toReturnBitcoin = round((toReturnDollars / tickerPrice),8)
 		print "after confirmation, dispensing $" , toDispenseValue , " which is " , toDispenseBills , "bills and keeping " , toTakeBitcoin , " Bitcoin"
-		print "sent " , toReturnBitcoin , " BTC to: " , theirAddress, " which is $" , toReturnDollars
-		# make sure we are not taking more than they actually have (after standard tx fee applied)
-		stdTxFee = (tx_fee.TX_FEE_PER_THOUSAND_BYTES / 100000000)
-		if (toTakeBitcoin + stdTxFee) > addressBalance:
-			toTakeBitcoin = addressBalance - stdTxFee
+		print "sending " , toReturnBitcoin , " BTC to: " , theirAddress, " which is $" , toReturnDollars
 		processTakeBTC(theirPrivateKey, toTakeBitcoin, toDispenseBills)
 
 def processTakeBTC(theirPrivateKey, toTakeBitcoin, toDispenseBills):
@@ -402,8 +406,10 @@ def giveBTC(address):
 	acceptCash()
 	print "cash acceptor is on"
 	time.sleep(2) # need to give them time to pull their phone away from the camera
+	print "main thread: telling camera to start"
 	to_cam.put('start')
 	try:
+		print "waiting for QR scan"
 		from_cam.get(True, 90) # this is blocking for 90 seconds while we wait now for a QR code.
 	except:
 		print "cam timeout"
@@ -493,7 +499,11 @@ def SSPreceive():
 	global decodeBufferSSP
 	decodeBufferSSP = array.array('B')
 	while CashDrop.inWaiting() > 0:
-		decodeBufferSSP.append(ord(CashDrop.read(1)))
+		try:
+			decodeBufferSSP.append(ord(CashDrop.read(1)))
+		except:
+			# SerialException('device reports readiness to read but returned no data (device disconnected?)')
+			return False
 
 def SSPcommunicate(command):
 	global seqStateSSP
@@ -607,7 +617,7 @@ def SSPdispense():
 				break
 	return True
 
-# start the subprocess, main loop, and gui
+# start the subprocess and main loop
 if __name__ == '__main__':
 	main()
 	multiprocessing.Process(target=scanQR, args=()).start()
